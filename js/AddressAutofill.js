@@ -1,3 +1,9 @@
+// Capture the executing script element immediately at parse time.
+// document.currentScript is only valid during synchronous script execution
+// and becomes null once the script finishes — so we must grab it here,
+// at the very top, before any class definitions or IIFEs run.
+const _aafCurrentScript = document.currentScript;
+
 /**
  * AddressAutofill.js
  * Automatically fills city, state, and zip fields based on address input.
@@ -422,15 +428,21 @@ class AddressAutofill {
 ───────────────────────────────────────────────────────────────── */
 
 (function autoInit() {
-  const scripts = document.querySelectorAll('script[src*="address-autofill"]');
-  const tag = [...scripts].find(s => s.dataset.address || s.dataset.city);
-  if (!tag) return; // no data attributes → skip auto-init
+  // Use the reference captured synchronously at parse time.
+  // Falls back to a filename-based query for edge cases (e.g. dynamically
+  // injected scripts where currentScript may already be null).
+  const tag = _aafCurrentScript ||
+    [...document.querySelectorAll('script[src]')]
+      .find(s => s.dataset.address || s.dataset.city || s.dataset.apiKey);
+
+  // Only auto-init when at least one field mapping is present on the tag.
+  if (!tag || !(tag.dataset.address || tag.dataset.city)) return;
 
   const run = () => {
     new AddressAutofill({
-      apiKey: tag.dataset.apiKey || '',
-      debounceDelay: Number(tag.dataset.debounce) || 400,
-      minChars: Number(tag.dataset.minChars) || 3,
+      apiKey:        tag.dataset.apiKey   || '',
+      debounceDelay: Number(tag.dataset.debounce  || 400),
+      minChars:      Number(tag.dataset.minChars  || 3),
       fields: {
         address: tag.dataset.address || '',
         city:    tag.dataset.city    || '',
@@ -443,6 +455,7 @@ class AddressAutofill {
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', run);
   } else {
+    // DOM already ready (script placed at bottom of body, or deferred)
     run();
   }
 })();
