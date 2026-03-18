@@ -12,15 +12,18 @@ const _aafCurrentScript = document.currentScript;
  *   <script
  *     src="address-autofill.js"
  *     data-api-key="YOUR_GOOGLE_MAPS_API_KEY"
- *     data-address="street_address"
+ *     data-address="street_address"a
  *     data-city="city"
  *     data-state="state"
  *     data-zip="zip_code"
+ *     data-scope="#my-form"
  *   ></script>
  *
  * PROGRAMMATIC USAGE:
  *   const autofill = new AddressAutofill({
  *     apiKey: 'YOUR_GOOGLE_MAPS_API_KEY',
+ *     scope: '#my-form',              // CSS selector or DOM element — REQUIRED when
+ *                                     // multiple forms share field names on one page
  *     fields: {
  *       address: 'street_address',   // name or id of the address input
  *       city:    'city',
@@ -48,6 +51,13 @@ class AddressAutofill {
     this.debounceDelay = options.debounceDelay ?? 400;
     this.minChars = options.minChars ?? 3;
     this.dropdownClass = options.dropdownClass || '';
+    // scope: CSS selector or DOM element to search within (e.g. '#my-form')
+    // Strongly recommended when multiple forms share field names on one page.
+    this.scope = options.scope
+      ? (typeof options.scope === 'string'
+          ? document.querySelector(options.scope)
+          : options.scope)
+      : document;
 
     this._debounceTimer = null;
     this._dropdown = null;
@@ -55,6 +65,7 @@ class AddressAutofill {
     this._autocompleteService = null;
     this._placesService = null;
     this._sessionToken = null;
+    this._filling = false; // guard against synthetic event re-trigger
 
     this._onInput = this._onInput.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
@@ -70,7 +81,8 @@ class AddressAutofill {
   /** Programmatically destroy the instance and remove all listeners/DOM. */
   destroy() {
     if (this._addressEl) {
-      this._addressEl.removeEventListener('input', this._onInput);
+      this._addressEl.removeEventListener('input',   this._onInput);
+      this._addressEl.removeEventListener('change',  this._onInput);
       this._addressEl.removeEventListener('keydown', this._onKeyDown);
     }
     document.removeEventListener('click', this._onDocClick);
@@ -126,9 +138,14 @@ class AddressAutofill {
       return;
     }
 
-    this._addressEl.setAttribute('autocomplete', 'off');
-    this._addressEl.addEventListener('input', this._onInput);
-    this._addressEl.addEventListener('keydown', this._onKeyDown);
+    if (this._addressEl.tagName === 'SELECT') {
+      // Selects fire 'change', not 'input'. No keyboard nav needed.
+      this._addressEl.addEventListener('change', this._onInput);
+    } else {
+      this._addressEl.setAttribute('autocomplete', 'off');
+      this._addressEl.addEventListener('input', this._onInput);
+      this._addressEl.addEventListener('keydown', this._onKeyDown);
+    }
     document.addEventListener('click', this._onDocClick);
   }
 
@@ -139,27 +156,47 @@ class AddressAutofill {
 
   _findField(nameOrId) {
     if (!nameOrId) return null;
+    const root = this.scope || document;
     return (
-      document.querySelector(`[name="${nameOrId}"]`) ||
-      document.querySelector(`#${CSS.escape(nameOrId)}`)
+      root.querySelector(`[name="${nameOrId}"]`) ||
+      root.querySelector(`#${CSS.escape(nameOrId)}`)
     );
   }
 
   _setFieldValue(el, value) {
-    if (!el) return;
+    if (!el || value == null) return;
+
+    const candidates = (Array.isArray(value) ? value : [value]).filter(Boolean);
+    if (!candidates.length) return;
+
+    // Prevent synthetic events from re-triggering _onInput on the address field
+    this._filling = true;
+
     if (el.tagName === 'SELECT') {
-      // Try to match by value first, then by text content
-      const opt = [...el.options].find(
-        o => o.value.toLowerCase() === value.toLowerCase() ||
-             o.text.toLowerCase() === value.toLowerCase()
-      );
-      if (opt) el.value = opt.value;
+      const options = [...el.options];
+      let matched = null;
+
+      for (const candidate of candidates) {
+        const lower = candidate.toLowerCase();
+        matched = options.find(
+          o => o.value.toLowerCase() === lower ||
+               o.text.toLowerCase()  === lower
+        );
+        if (matched) break;
+      }
+
+      if (matched) {
+        el.value = matched.value;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     } else {
-      el.value = value;
-      // Fire native events so framework bindings (Vue, React, etc.) pick up the change
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.value = candidates[0];
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     }
+
+    // Use a microtask so the flag clears after all synchronous event handlers run
+    Promise.resolve().then(() => { this._filling = false; });
   }
 
   /* ─────────────────────────────────────────
@@ -167,15 +204,28 @@ class AddressAutofill {
   ───────────────────────────────────────── */
 
   _onInput() {
-    clearTimeout(this._debounceTimer);
-    const query = this._addressEl.value.trim();
+    // Ignore events we fired ourselves during _setFieldValue
+    if (this._filling) return;
 
-    if (query.length < this.minChars) {
+    clearTimeout(this._debounceTimer);
+    const isSelect = this._addressEl.tagName === 'SELECT';
+    // For selects, use the selected option's visible text as the query
+    // so Google gets a readable address string, not just an option value.
+    const query = isSelect
+      ? (this._addressEl.selectedOptions[0]?.text || '').trim()
+      : this._addressEl.value.trim();
+
+    // Skip minChars guard for selects — the user chose a value, not typed
+    if (!isSelect && query.length < this.minChars) {
       this._removeDropdown();
       return;
     }
 
-    this._debounceTimer = setTimeout(() => this._fetchPredictions(query), this.debounceDelay);
+    if (!query) return;
+
+    // Use a shorter delay for selects since there's no typing involved
+    const delay = isSelect ? 0 : this.debounceDelay;
+    this._debounceTimer = setTimeout(() => this._fetchPredictions(query), delay);
   }
 
   /* ─────────────────────────────────────────
@@ -220,7 +270,9 @@ class AddressAutofill {
         this._setFieldValue(this._addressEl, streetAddress || place.formatted_address);
 
         this._setFieldValue(this._findField(this.fields.city),  parts.city);
-        this._setFieldValue(this._findField(this.fields.state), parts.state_short);
+        // Pass both short ("CA") and long ("California") so selects using
+        // either format will match correctly.
+        this._setFieldValue(this._findField(this.fields.state), [parts.state_short, parts.state_long]);
         this._setFieldValue(this._findField(this.fields.zip),   parts.zip);
 
         this._removeDropdown();
@@ -441,6 +493,7 @@ class AddressAutofill {
   const run = () => {
     new AddressAutofill({
       apiKey:        tag.dataset.apiKey   || '',
+      scope:         tag.dataset.scope    || null,
       debounceDelay: Number(tag.dataset.debounce  || 400),
       minChars:      Number(tag.dataset.minChars  || 3),
       fields: {
